@@ -64,6 +64,7 @@ from chia.wallet.notification_store import Notification
 from chia.wallet.outer_puzzles import AssetType
 from chia.wallet.payment import Payment
 from chia.wallet.puzzle_drivers import PuzzleInfo, Solver
+from chia.wallet.puzzles.cat_loader import CAT_MOD
 from chia.wallet.puzzles.clawback.metadata import AutoClaimSettings, ClawbackMetadata
 from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import puzzle_hash_for_synthetic_public_key
 from chia.wallet.singleton import create_singleton_puzzle
@@ -236,6 +237,9 @@ class WalletRpcApi:
             "/vc_add_proofs": self.vc_add_proofs,
             "/vc_get_proofs_for_root": self.vc_get_proofs_for_root,
             "/vc_revoke": self.vc_revoke,
+            # Custom
+            "/aggregate_spends": self.aggregate_spends,
+            "/cat_spend_bundle_only": self.cat_spend_bundle_only,
         }
 
     def get_connections(self, request_node_type: Optional[NodeType]) -> List[Dict[str, Any]]:
@@ -3605,3 +3609,125 @@ class WalletRpcApi:
         return {
             "transactions": [tx.to_json_dict_convenience(self.service.config) for tx in txs],
         }
+
+    ##########################################################################################
+    # Custom
+    ##########################################################################################
+    async def aggregate_spends(self, request) -> EndpointResult:
+
+        if request["spends"] is None:
+            return {"success": False, "error": "No spends"}
+
+        spend_bundles = [SpendBundle.from_json_dict(spend) for spend in request['spends']]
+        if len(spend_bundles) < 2:
+            return {"success": False, "error": "Must include 2 or more spends"}
+
+        agg_bundle = SpendBundle.aggregate(spend_bundles)
+        return {"success": True, "agg_bundle": agg_bundle}
+
+    async def cat_spend_bundle_only(self, request, hold_lock=True) -> EndpointResult:
+        if await self.service.wallet_state_manager.synced() is False:
+            raise ValueError("Wallet needs to be fully synced.")
+        wallet_id = uint32(request["wallet_id"])
+        wallet = self.service.wallet_state_manager.get_wallet(id=wallet_id, required_type=CATWallet)
+
+        amounts: List[uint64] = []
+        puzzle_hashes: List[bytes32] = []
+        memos: List[List[bytes]] = []
+        additions: Optional[List[Dict]] = request.get("additions")
+        if not isinstance(request["fee"], int) or (additions is None and not isinstance(request["amount"], int)):
+            raise ValueError("An integer amount or fee is required (too many decimals)")
+        if additions is not None:
+            for addition in additions:
+                receiver_ph = bytes32.from_hexstr(addition["puzzle_hash"])
+                if len(receiver_ph) != 32:
+                    raise ValueError(f"Address must be 32 bytes. {receiver_ph.hex()}")
+                amount = uint64(addition["amount"])
+                if amount > self.service.constants.MAX_COIN_AMOUNT:
+                    raise ValueError(f"Coin amount cannot exceed {self.service.constants.MAX_COIN_AMOUNT}")
+                amounts.append(amount)
+                puzzle_hashes.append(receiver_ph)
+                if "memos" in addition:
+                    memos.append([mem.encode("utf-8") for mem in addition["memos"]])
+        else:
+            amounts.append(uint64(request["amount"]))
+            puzzle_hashes.append(decode_puzzle_hash(request["inner_address"]))
+            if "memos" in request:
+                memos.append([mem.encode("utf-8") for mem in request["memos"]])
+        coins: Optional[Set[Coin]] = None
+        if "coins" in request and len(request["coins"]) > 0:
+            coins = set([Coin.from_json_dict(coin_json) for coin_json in request["coins"]])
+        fee: uint64 = uint64(request.get("fee", 0))
+        min_coin_amount: uint64 = uint64(request.get("min_coin_amount", 0))
+        max_coin_amount: uint64 = uint64(request.get("max_coin_amount", 0))
+        if max_coin_amount == 0:
+            max_coin_amount = uint64(self.service.wallet_state_manager.constants.MAX_COIN_AMOUNT)
+        exclude_coin_amounts: Optional[List[uint64]] = request.get("exclude_coin_amounts")
+        if exclude_coin_amounts is not None:
+            exclude_coin_amounts = [uint64(a) for a in exclude_coin_amounts]
+        exclude_coin_ids: Optional[List] = request.get("exclude_coin_ids")
+        if exclude_coin_ids is not None:
+            result = await self.service.wallet_state_manager.coin_store.get_coin_records(
+                coin_id_filter=HashFilter.include([bytes32.from_hexstr(hex_id) for hex_id in exclude_coin_ids])
+            )
+            exclude_coins = {wr.coin for wr in result.records}
+        else:
+            exclude_coins = None
+        cat_discrepancy_params: Tuple[Optional[int], Optional[str], Optional[str]] = (
+            request.get("extra_delta", None),
+            request.get("tail_reveal", None),
+            request.get("tail_solution", None),
+        )
+        cat_discrepancy: Optional[Tuple[int, Program, Program]] = None
+        if cat_discrepancy_params != (None, None, None):
+            if None in cat_discrepancy_params:
+                raise ValueError("Specifying extra_delta, tail_reveal, or tail_solution requires specifying the others")
+            else:
+                assert cat_discrepancy_params[0] is not None
+                assert cat_discrepancy_params[1] is not None
+                assert cat_discrepancy_params[2] is not None
+                cat_discrepancy = (
+                    cat_discrepancy_params[0],  # mypy sanitization
+                    Program.fromhex(cat_discrepancy_params[1]),
+                    Program.fromhex(cat_discrepancy_params[2]),
+                )
+        if hold_lock:
+            async with self.service.wallet_state_manager.lock:
+                txs: List[TransactionRecord] = await wallet.generate_signed_transaction(
+                    amounts,
+                    puzzle_hashes,
+                    fee,
+                    cat_discrepancy=cat_discrepancy,
+                    coins=coins,
+                    memos=memos if memos else None,
+                    min_coin_amount=min_coin_amount,
+                    max_coin_amount=max_coin_amount,
+                    exclude_coin_amounts=exclude_coin_amounts,
+                    exclude_cat_coins=exclude_coins,
+                    reuse_puzhash=request.get("reuse_puzhash", None),
+                )
+                for tx in txs:
+                    await wallet.standard_wallet.push_transaction(tx)
+        else:
+            txs = await wallet.generate_signed_transaction(
+                amounts,
+                puzzle_hashes,
+                fee,
+                coins=coins,
+                memos=memos if memos else None,
+                min_coin_amount=min_coin_amount,
+                max_coin_amount=max_coin_amount,
+                exclude_coin_amounts=exclude_coin_amounts,
+                exclude_cat_coins=exclude_coins,
+                reuse_puzhash=request.get("reuse_puzhash", None),
+            )
+            for tx in txs:
+                await wallet.standard_wallet.push_transaction(tx)
+
+        # Return the first transaction, which is expected to be the CAT spend. If a fee is
+        # included, it is currently ordered after the CAT spend.
+        return {
+            "spend_bundle": txs[0].to_json_dict_convenience(self.service.config),
+        }
+
+    

@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from chia.consensus.block_record import BlockRecord
 from chia.consensus.cost_calculator import NPCResult
+from chia.consensus.default_constants import DEFAULT_CONSTANTS
 from chia.consensus.pos_quality import UI_ACTUAL_SPACE_CONSTANT_FACTOR
 from chia.full_node.fee_estimator_interface import FeeEstimatorInterface
 from chia.full_node.full_node import FullNode
 from chia.full_node.mempool_check_conditions import get_puzzle_and_solution_for_coin, get_spends_for_block
 from chia.rpc.rpc_server import Endpoint, EndpointResult
 from chia.server.outbound_message import NodeType
+from chia.types.blockchain_format.program import INFINITE_COST, Program
 from chia.types.blockchain_format.sized_bytes import bytes32
 from chia.types.coin_record import CoinRecord
 from chia.types.coin_spend import CoinSpend
@@ -24,6 +27,8 @@ from chia.util.ints import uint32, uint64, uint128
 from chia.util.log_exceptions import log_exceptions
 from chia.util.math import make_monotonically_decreasing
 from chia.util.ws_message import WsRpcMessage, create_payload_dict
+from chia.wallet.util.debug_spend_bundle import disassemble
+from chia.wallet.puzzles.cat_loader import CAT_MOD
 
 
 def coin_record_dict_backwards_compat(coin_record: Dict[str, Any]) -> Dict[str, bool]:
@@ -71,6 +76,12 @@ class FullNodeRpcApi:
             "/get_mempool_item_by_tx_id": self.get_mempool_item_by_tx_id,
             # Fee estimation
             "/get_fee_estimate": self.get_fee_estimate,
+            # Custom
+            "/get_height": self.get_height,
+            "/get_nft_recipient_address": self.get_nft_recipient_address,
+            "/get_mempool_info": self.get_mempool_info,
+            "/get_spend_bundle_inclusion_cost": self.get_spend_bundle_inclusion_cost,
+            "/get_cat_sender_info": self.get_cat_sender_info,
         }
 
     async def _state_changed(self, change: str, change_data: Optional[Dict[str, Any]] = None) -> List[WsRpcMessage]:
@@ -676,6 +687,8 @@ class FullNodeRpcApi:
             raise ValueError(f"Failed to include transaction {spend_name}, error {error.name}")
         return {
             "status": status.name,
+            # Custom
+            "spend_bundle_name": spend_bundle.name(),
         }
 
     async def get_puzzle_and_solution(self, request: Dict[str, Any]) -> EndpointResult:
@@ -866,3 +879,110 @@ class FullNodeRpcApi:
             "fee_rate_last_block": fee_rate_last_block,
             "last_tx_block_height": last_tx_block_height,
         }
+
+###########################################################################################
+## CUSTOM
+###########################################################################################
+
+    async def get_nft_recipient_address(self, request: Dict) -> EndpointResult:
+        if "puzzle_reveal" not in request:
+            raise ValueError("No puzzle_reveal in request")
+        if "solution" not in request:
+            raise ValueError("No solution in request")
+
+        puzzle: Program = Program.fromhex(request["puzzle_reveal"])
+        solution: Program = Program.fromhex(request["solution"])
+        result: Program = puzzle.run(solution)
+
+        conditions = result.as_iter()
+        sender_puzzle_hash: str
+        for condition in conditions:
+            if condition.first() == 51:
+                cond = disassemble(condition)
+                sent_cond = re.findall("[A-Za-z0-9]+", cond)
+                sender_puzzle_hash = sent_cond[4]
+
+        if sender_puzzle_hash is None:
+            raise ValueError("Condition Not Found")
+
+        return {"recipient_puzzle_hash": sender_puzzle_hash}
+
+    async def get_spend_bundle_inclusion_cost(self, request: Dict):
+        if "spend_bundle" not in request:
+            raise ValueError("No spend_bundle in request")
+        spend_bundle: SpendBundle = SpendBundle.from_json_dict(request["spend_bundle"])
+
+        sb_cost = 0
+        for spend in spend_bundle.coin_spends:
+            cost, _ = spend.puzzle_reveal.run_with_cost(INFINITE_COST, spend.solution)
+            sb_cost += cost
+
+        # Using sb_cost * 2 to ensure overhead, gives about 5% for a spend bundle of 32 items
+        room_in_mempool = False if self.service.mempool_manager.mempool.at_full_capacity(sb_cost * 2) else True
+        fee_to_spend = self.service.mempool_manager.mempool.get_min_fee_rate(sb_cost)
+
+        return {
+            "cost": sb_cost,
+            "room_in_mempool": room_in_mempool,
+            "fee_to_spend": fee_to_spend,
+            "min_valid_fee": sb_cost * 5,
+        }
+
+
+    async def get_mempool_info(self, request:Dict):
+        return {
+            "mempool_current_cost_size": self.service.mempool_manager.mempool.total_mempool_cost,
+            "mempool_max_cost_size": DEFAULT_CONSTANTS.MAX_BLOCK_COST_CLVM
+        }
+
+    async def get_height(self, request:Dict):
+        return {"height": self.service.blockchain.get_peak().height}
+
+    async def unwrap_cat_address(self, request: Dict):
+
+        if not request["coin_record"]:
+            raise ValueError("Must include coin_record")
+
+        record = request["coin_record"]
+        dict = {
+            "coin_id": record["coin"]["parent_coin_info"],
+            "height": record["confirmed_block_index"]
+        }
+
+        spend_dict = await self.get_puzzle_and_solution(dict)
+        coin_solution = CoinSpend.from_json_dict(spend_dict["coin_solution"])
+        program, _ = coin_solution.solution.to_program().uncurry()
+        list = disassemble(program)
+
+        matches = re.findall(r'\(CREATE_COIN ([^ ]+) ([^)]+)\)', list)
+
+        return {"unwrapped_puzzlehash": matches[1][0]}
+
+    async def get_cat_sender_info(self, request: Dict):
+
+        if not request["coin_record"]:
+            raise ValueError("Must include coin_record")
+
+        record = request["coin_record"]
+        dict = {
+            "coin_id": record["coin"]["parent_coin_info"],
+            "height": record["confirmed_block_index"]
+        }
+        spend_dict = await self.get_puzzle_and_solution(dict)
+
+        coin_solution = CoinSpend.from_json_dict(spend_dict["coin_solution"])
+        mod, args = coin_solution.puzzle_reveal.to_program().uncurry()
+
+        if not mod == CAT_MOD:
+            raise ValueError("Coin is not a CAT")
+
+        program, _ = coin_solution.solution.to_program().uncurry()
+        s_list = disassemble(program)
+        sender_addr = re.findall(r'\(CREATE_COIN ([^ ]+) ([^)]+)\)', s_list)[1][0]
+        _, tail_hash, _ = args.as_iter()
+
+        return {
+            "sender_puzzle_hash":  sender_addr,
+            "asset_id": tail_hash
+        }
+
