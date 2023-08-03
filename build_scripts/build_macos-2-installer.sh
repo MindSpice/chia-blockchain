@@ -32,8 +32,14 @@ if [ "$LAST_EXIT_CODE" -ne 0 ]; then
 	echo >&2 "pyinstaller failed!"
 	exit $LAST_EXIT_CODE
 fi
-cp -r dist/daemon ../chia-blockchain-gui/packages/gui
 
+
+# Creates a directory of licenses
+echo "Building pip and NPM license directory"
+pwd
+bash ./build_license_directory.sh
+
+cp -r dist/daemon ../chia-blockchain-gui/packages/gui
 # Change to the gui package
 cd ../chia-blockchain-gui/packages/gui || exit 1
 
@@ -58,8 +64,8 @@ else
 	echo "Not on ci or no secrets so not signing"
 	export CSC_IDENTITY_AUTO_DISCOVERY=false
 fi
-echo electron-builder build --mac "${OPT_ARCH}" --config.productName="$PRODUCT_NAME"
-electron-builder build --mac "${OPT_ARCH}" --config.productName="$PRODUCT_NAME"
+echo electron-builder build --mac "${OPT_ARCH}" --config.productName="$PRODUCT_NAME" --config.mac.minimumSystemVersion="11"
+electron-builder build --mac "${OPT_ARCH}" --config.productName="$PRODUCT_NAME" --config.mac.minimumSystemVersion="11"
 LAST_EXIT_CODE=$?
 ls -l dist/mac*/chia.app/Contents/Resources/app.asar
 

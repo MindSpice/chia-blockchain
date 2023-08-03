@@ -3,9 +3,11 @@ from __future__ import annotations
 import dataclasses
 import logging
 import time
+import traceback
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Type, TypeVar, Union
 
 from blspy import G1Element, G2Element
+from typing_extensions import Unpack
 
 from chia.protocols.wallet_protocol import CoinState
 from chia.server.ws_connection import WSChiaConnection
@@ -19,7 +21,6 @@ from chia.util.ints import uint32, uint64, uint128
 from chia.wallet.did_wallet.did_wallet import DIDWallet
 from chia.wallet.payment import Payment
 from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import solution_for_conditions
-from chia.wallet.sign_coin_spends import sign_coin_spends
 from chia.wallet.transaction_record import TransactionRecord
 from chia.wallet.util.compute_memos import compute_memos
 from chia.wallet.util.transaction_type import TransactionType
@@ -30,6 +31,7 @@ from chia.wallet.vc_wallet.vc_store import VCRecord, VCStore
 from chia.wallet.wallet import Wallet
 from chia.wallet.wallet_coin_record import WalletCoinRecord
 from chia.wallet.wallet_info import WalletInfo
+from chia.wallet.wallet_protocol import GSTOptionalArgs, WalletProtocol
 
 if TYPE_CHECKING:
     from chia.wallet.wallet_state_manager import WalletStateManager  # pragma: no cover
@@ -103,7 +105,13 @@ class VCWallet:
                 f"Cannot get verified credential coin: {coin.name().hex()} puzzle and solution"
             )  # pragma: no cover
             return  # pragma: no cover
-        vc = VerifiedCredential.get_next_from_coin_spend(cs)
+        try:
+            vc = VerifiedCredential.get_next_from_coin_spend(cs)
+        except Exception as e:  # pragma: no cover
+            self.log.debug(
+                f"Syncing VC from coin spend failed (likely means it was revoked): {e}\n{traceback.format_exc()}"
+            )
+            return
         vc_record: VCRecord = VCRecord(vc, height)
         self.wallet_state_manager.state_changed(
             "vc_coin_added", self.id(), dict(launcher_id=vc_record.vc.launcher_id.hex())
@@ -171,12 +179,7 @@ class VCWallet:
         solution = solution_for_conditions(dpuz.rest())
         original_puzzle = await self.standard_wallet.puzzle_for_puzzle_hash(original_coin.puzzle_hash)
         coin_spends.append(CoinSpend(original_coin, original_puzzle, solution))
-        spend_bundle = await sign_coin_spends(
-            coin_spends,
-            self.standard_wallet.secret_key_store.secret_key_for_public_key,
-            self.wallet_state_manager.constants.AGG_SIG_ME_ADDITIONAL_DATA,
-            self.wallet_state_manager.constants.MAX_BLOCK_COST_CLVM,
-        )
+        spend_bundle = await self.wallet_state_manager.sign_transaction(coin_spends)
         now = uint64(int(time.time()))
         add_list: List[Coin] = list(spend_bundle.additions())
         rem_list: List[Coin] = list(spend_bundle.removals())
@@ -211,10 +214,13 @@ class VCWallet:
         puzzle_announcements: Optional[Set[bytes]] = None,
         coin_announcements_to_consume: Optional[Set[Announcement]] = None,
         puzzle_announcements_to_consume: Optional[Set[Announcement]] = None,
-        new_proof_hash: Optional[bytes32] = None,  # Requires that this key posesses the DID to update the specified VC
-        provider_inner_puzhash: Optional[bytes32] = None,
         reuse_puzhash: Optional[bool] = None,
+        **kwargs: Unpack[GSTOptionalArgs],
     ) -> List[TransactionRecord]:
+        new_proof_hash: Optional[bytes32] = kwargs.get(
+            "new_proof_hash", None
+        )  # Requires that this key posesses the DID to update the specified VC
+        provider_inner_puzhash: Optional[bytes32] = kwargs.get("provider_inner_puzhash", None)
         """
         Entry point for two standard actions:
          - Cycle the singleton and make an announcement authorizing something
@@ -285,14 +291,7 @@ class VCWallet:
             magic_conditions=[magic_condition],
         )
         did_announcement, coin_spend, vc = vc_record.vc.do_spend(inner_puzzle, innersol, new_proof_hash)
-        spend_bundles = [
-            await sign_coin_spends(
-                [coin_spend],
-                self.standard_wallet.secret_key_store.secret_key_for_public_key,
-                self.wallet_state_manager.constants.AGG_SIG_ME_ADDITIONAL_DATA,
-                self.wallet_state_manager.constants.MAX_BLOCK_COST_CLVM,
-            )
-        ]
+        spend_bundles = [await self.wallet_state_manager.sign_transaction([coin_spend])]
         if did_announcement is not None:
             # Need to spend DID
             for _, wallet in self.wallet_state_manager.wallets.items():
@@ -366,8 +365,7 @@ class VCWallet:
         _, provider_inner_puzhash, _ = recovery_info
 
         # Generate spend specific nonce
-        coins = await did_wallet.select_coins(uint64(1))
-        assert coins is not None
+        coins = {await did_wallet.get_coin()}
         coins.add(vc.coin)
         if fee > 0:
             coins.update(await self.standard_wallet.select_coins(fee))
@@ -453,6 +451,4 @@ class VCWallet:
 
 
 if TYPE_CHECKING:
-    from chia.wallet.wallet_protocol import WalletProtocol  # pragma: no cover
-
     _dummy: WalletProtocol = VCWallet()  # pragma: no cover

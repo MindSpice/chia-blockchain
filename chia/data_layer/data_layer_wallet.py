@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Set, Tupl
 
 from blspy import G1Element, G2Element
 from clvm.EvalError import EvalError
-from typing_extensions import final
+from typing_extensions import Unpack, final
 
 from chia.consensus.block_record import BlockRecord
 from chia.data_layer.data_layer_errors import LauncherCoinNotFoundError, OfferIntegrityError
@@ -45,7 +45,6 @@ from chia.wallet.outer_puzzles import AssetType
 from chia.wallet.payment import Payment
 from chia.wallet.puzzle_drivers import PuzzleInfo, Solver
 from chia.wallet.puzzles.singleton_top_layer_v1_1 import SINGLETON_LAUNCHER_HASH
-from chia.wallet.sign_coin_spends import sign_coin_spends
 from chia.wallet.trading.offer import NotarizedPayment, Offer
 from chia.wallet.transaction_record import TransactionRecord
 from chia.wallet.util.compute_memos import compute_memos
@@ -56,6 +55,7 @@ from chia.wallet.util.wallet_types import WalletType
 from chia.wallet.wallet import Wallet
 from chia.wallet.wallet_coin_record import WalletCoinRecord
 from chia.wallet.wallet_info import WalletInfo
+from chia.wallet.wallet_protocol import GSTOptionalArgs, WalletProtocol
 
 if TYPE_CHECKING:
     from chia.wallet.wallet_state_manager import WalletStateManager
@@ -106,8 +106,6 @@ class Mirror:
 @final
 class DataLayerWallet:
     if TYPE_CHECKING:
-        from chia.wallet.wallet_protocol import WalletProtocol
-
         _protocol_check: ClassVar[WalletProtocol] = cast("DataLayerWallet", None)
 
     wallet_state_manager: WalletStateManager
@@ -565,7 +563,6 @@ class DataLayerWallet:
             SerializedProgram.from_program(current_full_puz),
             SerializedProgram.from_program(full_sol),
         )
-        await self.standard_wallet.hack_populate_secret_key_for_puzzle_hash(current_inner_puzzle.get_tree_hash())
 
         if sign:
             spend_bundle = await self.sign(coin_spend)
@@ -627,13 +624,15 @@ class DataLayerWallet:
         coin_announcements_to_consume: Optional[Set[Announcement]] = None,
         puzzle_announcements_to_consume: Optional[Set[Announcement]] = None,
         ignore_max_send_amount: bool = False,  # ignored
-        # This wallet only
-        launcher_id: Optional[bytes32] = None,
-        new_root_hash: Optional[bytes32] = None,
-        sign: bool = True,  # This only prevent signing of THIS wallet's part of the tx (fee will still be signed)
-        add_pending_singleton: bool = True,
-        announce_new_state: bool = False,
+        **kwargs: Unpack[GSTOptionalArgs],
     ) -> List[TransactionRecord]:
+        launcher_id: Optional[bytes32] = kwargs.get("launcher_id", None)
+        new_root_hash: Optional[bytes32] = kwargs.get("new_root_hash", None)
+        sign: bool = kwargs.get(
+            "sign", True
+        )  # This only prevent signing of THIS wallet's part of the tx (fee will still be signed)
+        add_pending_singleton: bool = kwargs.get("add_pending_singleton", True)
+        announce_new_state: bool = kwargs.get("announce_new_state", False)
         # Figure out the launcher ID
         if len(coins) == 0:
             if launcher_id is None:
@@ -747,8 +746,6 @@ class DataLayerWallet:
         ] = await self.wallet_state_manager.puzzle_store.get_derivation_record_for_puzzle_hash(parent_coin.puzzle_hash)
         if inner_puzzle_derivation is None:
             raise ValueError(f"DL Wallet does not have permission to delete mirror with ID {mirror_id}")
-
-        await self.standard_wallet.hack_populate_secret_key_for_puzzle_hash(parent_coin.puzzle_hash)
 
         parent_inner_puzzle: Program = self.standard_wallet.puzzle_for_pk(inner_puzzle_derivation.pubkey)
         new_puzhash: bytes32 = await self.get_new_puzzlehash()
@@ -1077,12 +1074,7 @@ class DataLayerWallet:
         return uint128(0)
 
     async def sign(self, coin_spend: CoinSpend) -> SpendBundle:
-        return await sign_coin_spends(
-            [coin_spend],
-            self.standard_wallet.secret_key_store.secret_key_for_public_key,
-            self.wallet_state_manager.constants.AGG_SIG_ME_ADDITIONAL_DATA,
-            self.wallet_state_manager.constants.MAX_BLOCK_COST_CLVM,
-        )
+        return await self.wallet_state_manager.sign_transaction([coin_spend])
 
     def get_name(self) -> str:
         return self.wallet_info.name
@@ -1126,7 +1118,6 @@ class DataLayerWallet:
         driver_dict: Dict[bytes32, PuzzleInfo],
         solver: Solver,
         fee: uint64 = uint64(0),
-        old: bool = False,
     ) -> Offer:
         dl_wallet = None
         for wallet in wallet_state_manager.wallets.values():
@@ -1189,7 +1180,7 @@ class DataLayerWallet:
             for k, v in offer_dict.items()
             if v > 0
         }
-        return Offer(requested_payments, SpendBundle.aggregate(all_bundles), driver_dict, old)
+        return Offer(requested_payments, SpendBundle.aggregate(all_bundles), driver_dict)
 
     @staticmethod
     async def finish_graftroot_solutions(offer: Offer, solver: Solver) -> Offer:
@@ -1263,7 +1254,7 @@ class DataLayerWallet:
                     spend = new_spend
             new_spends.append(spend)
 
-        return Offer({}, SpendBundle(new_spends, offer.aggregated_signature()), offer.driver_dict, offer.old)
+        return Offer({}, SpendBundle(new_spends, offer.aggregated_signature()), offer.driver_dict)
 
     @staticmethod
     async def get_offer_summary(offer: Offer) -> Dict[str, Any]:
