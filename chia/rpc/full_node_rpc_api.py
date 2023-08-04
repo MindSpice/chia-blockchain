@@ -29,7 +29,8 @@ from chia.util.log_exceptions import log_exceptions
 from chia.util.math import make_monotonically_decreasing
 from chia.util.ws_message import WsRpcMessage, create_payload_dict
 from chia.wallet.util.debug_spend_bundle import disassemble
-from chia.wallet.puzzles.cat_loader import CAT_MOD
+from chia.wallet.puzzles.tails import CAT_MOD
+
 
 
 def coin_record_dict_backwards_compat(coin_record: Dict[str, Any]) -> Dict[str, bool]:
@@ -1023,11 +1024,15 @@ class FullNodeRpcApi:
 
         program, _ = coin_solution.solution.to_program().uncurry()
         s_list = disassemble(program)
-        sender_addr = re.findall(r'\(CREATE_COIN ([^ ]+) ([^)]+)\)', s_list)[1][0]
-        _, tail_hash, _ = args.as_iter()
-
+        sender_addr = re.search(r'CREATE_COIN [0-9a-fA-Fx]+ \d+ \(([0-9a-fA-Fx]+)\)', s_list).group(1)
+        a, tail_hash, b = args.as_iter()
+        tail_hash = str(tail_hash)
         return {
-            "sender_puzzle_hash":  sender_addr,
-            "asset_id": tail_hash
+            # "sender_puzzle_hash":  sender_addr,
+            # "asset_id": tail_hash
+
+            "sender_puzzle_hash": sender_addr,
+            # replace is hackish not sure why tail_hash always has the added a0
+            "asset_id": tail_hash.replace("a0", "0x", 1) if tail_hash.startswith("a0") else tail_hash
         }
 
