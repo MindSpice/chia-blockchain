@@ -975,13 +975,13 @@ class FullNodeRpcApi:
         }
 
 
-    async def get_mempool_info(self, request:Dict):
+    async def get_mempool_info(self, request: Dict):
         return {
             "mempool_current_cost_size": self.service.mempool_manager.mempool.total_mempool_cost,
             "mempool_max_cost_size": DEFAULT_CONSTANTS.MAX_BLOCK_COST_CLVM
         }
 
-    async def get_height(self, request:Dict):
+    async def get_height(self, request: Dict):
         return {"height": self.service.blockchain.get_peak().height}
 
     async def unwrap_cat_address(self, request: Dict):
