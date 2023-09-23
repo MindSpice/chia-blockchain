@@ -51,7 +51,7 @@ class Options(Enum):
     BLADEBIT_NO_T2_DIRECT = 36
     COMPRESSION = 37
     BLADEBIT_DEVICE_INDEX = 38
-    BLADEBIT_NO_DIRECT_DOWNLOADS = 39
+    CUDA_TMP_DIR = 40
 
 
 chia_plotter_options = [
@@ -101,6 +101,8 @@ bladebit_cuda_plotter_options = [
     Options.FARMERKEY,
     Options.POOLKEY,
     Options.POOLCONTRACT,
+    Options.CUDA_TMP_DIR,
+    Options.TMP_DIR2,
     Options.ID,
     Options.BLADEBIT_WARMSTART,
     Options.BLADEBIT_NONUMA,
@@ -110,7 +112,6 @@ bladebit_cuda_plotter_options = [
     Options.FINAL_DIR,
     Options.COMPRESSION,
     Options.BLADEBIT_DEVICE_INDEX,
-    Options.BLADEBIT_NO_DIRECT_DOWNLOADS,
 ]
 
 bladebit_ram_plotter_options = [
@@ -190,6 +191,15 @@ def build_parser(subparsers, root_path, option_list, name, plotter_desc):
                 type=int,
                 help="Stripe size.",
                 default=0,
+            )
+        if option is Options.CUDA_TMP_DIR:
+            parser.add_argument(
+                "-t",
+                "--tmp_dir",
+                type=str,
+                dest="tmpdir",
+                help="Temporary directory 1.",
+                required=False,  # Unlike `Options.TMP_DIR`, this is not required
             )
         if option is Options.TMP_DIR:
             parser.add_argument(
@@ -453,13 +463,6 @@ def build_parser(subparsers, root_path, option_list, name, plotter_desc):
                 type=int,
                 help="The CUDA device index",
                 default=0,
-            )
-        if option is Options.BLADEBIT_NO_DIRECT_DOWNLOADS:
-            parser.add_argument(
-                "--no-direct-downloads",
-                action="store_true",
-                help="Don't allocate host tables using pinned buffers",
-                default=False,
             )
 
 
