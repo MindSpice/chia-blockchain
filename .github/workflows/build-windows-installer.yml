@@ -33,15 +33,19 @@ concurrency:
   group: ${{ github.ref }}-${{ github.workflow }}-${{ github.event_name }}-${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.ref, 'refs/heads/long_lived/')) && github.sha || '' }}
   cancel-in-progress: true
 
+permissions:
+  id-token: write
+  contents: write
+
 jobs:
   build:
-    name: Windows 10 Installer
+    name: Build EXE
     runs-on: [windows-2019]
     timeout-minutes: 65
     strategy:
       fail-fast: false
       matrix:
-        python-version: [3.9]
+        python-version: ["3.10"]
 
     steps:
     - name: Checkout Code
@@ -104,10 +108,10 @@ jobs:
       with:
         python-version: ${{ matrix.python-version }}
 
-    - name: Setup Node 16.x
+    - name: Setup Node 18.x
       uses: actions/setup-node@v3
       with:
-        node-version: '16.x'
+        node-version: '18.x'
 
     - name: Test for secrets access
       id: check_secrets
@@ -127,7 +131,7 @@ jobs:
         echo HAS_GLUE_SECRET=${HAS_GLUE_SECRET} >> "$GITHUB_OUTPUT"
       env:
         SIGNING_SECRET: "${{ secrets.SM_CLIENT_CERT_FILE_B64 }}"
-        AWS_SECRET: "${{ secrets.INSTALLER_UPLOAD_KEY }}"
+        AWS_SECRET: "${{ secrets.CHIA_AWS_ACCOUNT_ID }}"
         GLUE_ACCESS_TOKEN: "${{ secrets.GLUE_ACCESS_TOKEN }}"
 
     - name: Setup Certificate
@@ -271,12 +275,11 @@ jobs:
       run: |
           msiexec.exe /i https://awscli.amazonaws.com/AWSCLIV2.msi
 
-    - name: Configure AWS Credentials
+    - name: Configure AWS credentials
       if: steps.check_secrets.outputs.HAS_AWS_SECRET
       uses: aws-actions/configure-aws-credentials@v2
       with:
-        aws-access-key-id: ${{ secrets.INSTALLER_UPLOAD_KEY }}
-        aws-secret-access-key: ${{ secrets.INSTALLER_UPLOAD_SECRET }}
+        role-to-assume: arn:aws:iam::${{ secrets.CHIA_AWS_ACCOUNT_ID }}:role/installer-upload
         aws-region: us-west-2
 
     - name: Upload to s3
@@ -331,8 +334,19 @@ jobs:
       run: |
         gh release upload $env:RELEASE_TAG ${{ github.workspace }}\chia-blockchain-gui\release-builds\windows-installer\ChiaSetup-${{ steps.version_number.outputs.CHIA_INSTALLER_VERSION }}.exe
 
+    - name: Mark pre-release installer complete
+      if: steps.check_secrets.outputs.HAS_GLUE_SECRET && env.PRE_RELEASE == 'true'
+      run: |
+        $headers = @{
+            Authorization="Bearer ${{ secrets.GLUE_ACCESS_TOKEN }}"
+        }
+        $data = @{
+            chia_ref='${{ env.RELEASE_TAG }}'
+        }
+        $json = $data | ConvertTo-Json
+        $response = Invoke-RestMethod '${{ secrets.GLUE_API_URL }}/api/v1/${{ env.RFC_REPO }}-prerelease/${{ env.RELEASE_TAG }}/success/build-windows' -Method Post -Body $json -ContentType 'application/json' -Headers $headers
 
-    - name: Mark installer complete
+    - name: Mark release installer complete
       if: steps.check_secrets.outputs.HAS_GLUE_SECRET && env.FULL_RELEASE == 'true'
       run: |
         $headers = @{
@@ -350,3 +364,47 @@ jobs:
         Remove-Item .\chia-blockchain-gui\packages\gui\daemon -Recurse -Force
         Remove-Item .\chia-blockchain-gui\Chia-win32-x64 -Recurse -Force
         Remove-Item .\chia-blockchain-gui\release-builds -Recurse -Force
+
+  test:
+    name: Test ${{ matrix.os.name }}
+    runs-on: ${{ matrix.os.runs-on[matrix.arch.matrix] }}
+    needs:
+    - build
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - name: 2019
+            matrix: 2019
+            runs-on:
+              intel: windows-2019
+          - name: 2022
+            matrix: 2022
+            runs-on:
+              intel: windows-2022
+        arch:
+          - name: Intel
+            matrix: intel
+
+    steps:
+    - uses: Chia-Network/actions/clean-workspace@main
+
+    - name: Download packages
+      uses: actions/download-artifact@v3
+      with:
+        name: chia-installers-windows-exe-intel
+        path: packages
+
+    - name: Install package
+      env:
+        INSTALL_PATH: ${{ github.workspace }}\installed
+      run: |
+        dir ./packages/
+        $env:INSTALLER_PATH = (Get-ChildItem packages/windows-installer/ChiaSetup-*.exe)
+        Start-Process -Wait -FilePath $env:INSTALLER_PATH -ArgumentList "/S", ("/D=" + $env:INSTALL_PATH)
+
+    - name: Run chia version
+      env:
+        INSTALL_PATH: ${{ github.workspace }}\installed
+      run: |
+        & ($env:INSTALL_PATH + "\resources\app.asar.unpacked\daemon\chia.exe") version
