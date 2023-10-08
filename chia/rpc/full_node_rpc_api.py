@@ -32,7 +32,7 @@ from chia.util.ints import uint32, uint64, uint128
 from chia.util.log_exceptions import log_exceptions
 from chia.util.math import make_monotonically_decreasing
 from chia.util.ws_message import WsRpcMessage, create_payload_dict
-from chia.wallet.util.debug_spend_bundle import disassemble
+from chia.wallet.util.debug_spend_bundle import disassemble, uncurry_dump
 from chia.wallet.puzzles.tails import CAT_MOD
 
 
@@ -1003,33 +1003,89 @@ class FullNodeRpcApi:
     async def get_height(self, request: Dict):
         return {"height": self.service.blockchain.get_peak().height}
 
+
+    # if not request["coin_record"]:
+    #     raise ValueError("Must include coin_record")
+    #
+    # record = request["coin_record"]
+    # dict = {
+    #     "coin_id": record["coin"]["parent_coin_info"],
+    #     "height": record["confirmed_block_index"]
+    # }
+    #
+    # spend_dict = await self.get_puzzle_and_solution(dict)
+    # coin_solution = CoinSpend.from_json_dict(spend_dict["coin_solution"])
+    # program, _ = coin_solution.solution.to_program().uncurry()
+    # list = disassemble(program)
+    #
+    # matches = re.findall(r'\(CREATE_COIN ([^ ]+) ([^)]+)\)', list)
+    #
+    # return {"unwrapped_puzzlehash": matches[1][0]}
+
+
+
     async def unwrap_cat_address(self, request: Dict):
+
+        def get_tail_wrapped_puzhash(xch_puzhash: Union[str, bytes32], tail: Union[str, bytes32]) -> bytes32:
+            """
+            Returns the tail-wrapped puzzle hash for a given XCH puzzle hash
+            """
+            if not isinstance(tail, bytes):
+                tail = bytes.fromhex(tail)
+            if not isinstance(xch_puzhash, bytes):
+                xch_puzhash = bytes.fromhex(xch_puzhash)
+
+            return CAT_MOD.curry(
+                CAT_MOD.get_tree_hash(), tail, xch_puzhash
+            ).get_tree_hash(xch_puzhash)
 
         if not request["coin_record"]:
             raise ValueError("Must include coin_record")
 
         record = request["coin_record"]
-        dict = {
+        parent_dict = {
             "coin_id": record["coin"]["parent_coin_info"],
             "height": record["confirmed_block_index"]
         }
+        parent_spend = await self.get_puzzle_and_solution(parent_dict)
+        parent_program = parent_spend.solution.to_program()
 
-        spend_dict = await self.get_puzzle_and_solution(dict)
         coin_solution = CoinSpend.from_json_dict(spend_dict["coin_solution"])
-        program, _ = coin_solution.solution.to_program().uncurry()
-        list = disassemble(program)
+        mod, args = coin_solution.puzzle_reveal.to_program().uncurry()
+        if not mod == CAT_MOD:
+            raise ValueError("Coin is not a CAT")
 
-        matches = re.findall(r'\(CREATE_COIN ([^ ]+) ([^)]+)\)', list)
+        a, tail_hash, b = args.as_iter()
+        tail_hash = str(tail_hash)
+        tail_hash = tail_hash.replace("a0", "0x", 1) if tail_hash.startswith("a0") else tail_hash
 
-        return {"unwrapped_puzzlehash": matches[1][0]}
+        inner_solution = parent_program.at("frfr")
+        payments = []
+        for condition in inner_solution.as_iter():
+            condition_list = condition.as_atom_list()
+            if condition_list[0] == ConditionOpcode.CREATE_COIN:
+                payments.append(Payment.from_condition(condition))
+
+        for p in payments:
+            if get_tail_wrapped_puzhash(p.puzzle_hash, tail_hash) == record.coin.puzzle_hash:
+                return {
+                    "sender_puzzle_hash": get_tail_wrapped_puzhash + "| " + record.coin.puzzle_hash,
+                    "tail_hash" : tail_hash
+                }
+
+        raise ValueError("Sender not found")
 
 
     async def get_cat_sender_info(self, request: Dict):
 
+
         if not request["coin_record"]:
             raise ValueError("Must include coin_record")
 
         record = request["coin_record"]
+        parent_record = self.get_coin_record_by_name(record["parent_coin_info"])
+
+
         dict = {
             "coin_id": record["coin"]["parent_coin_info"],
             "height": record["confirmed_block_index"]
@@ -1044,9 +1100,14 @@ class FullNodeRpcApi:
 
         program, _ = coin_solution.solution.to_program().uncurry()
         s_list = disassemble(program)
-        #sender_addr = re.search(r'CREATE_COIN [0-9a-fA-Fx]+ \d+ \(([0-9a-fA-Fx]+)\)', s_list).group(2)
-        cat_pattern = r'CREATE_COIN ([0-9a-fx]+).*?CREATE_COIN ([0-9a-fx]+)'
-        sender_addr = re.search(cat_pattern, s_list, re.DOTALL).group(2)
+        sender_match = re.search(r'CREATE_COIN [0-9a-fA-Fx]+ \d+ \(([0-9a-fA-Fx]+)\)', s_list)
+       # cat_pattern = r'CREATE_COIN ([0-9a-fx]+).*?CREATE_COIN ([0-9a-fx]+)'
+       # sender_match = re.search(cat_pattern, s_list, re.DOTALL)
+        if sender_match:
+            sender_addr = sender_match.group(1)
+        else:
+            sender_addr = ""
+
 
         a, tail_hash, b = args.as_iter()
         tail_hash = str(tail_hash)
