@@ -1023,6 +1023,7 @@ class FullNodeRpcApi:
 
         return {"unwrapped_puzzlehash": matches[1][0]}
 
+
     async def get_cat_sender_info(self, request: Dict):
 
         if not request["coin_record"]:
@@ -1043,15 +1044,16 @@ class FullNodeRpcApi:
 
         program, _ = coin_solution.solution.to_program().uncurry()
         s_list = disassemble(program)
-        sender_addr = re.search(r'CREATE_COIN [0-9a-fA-Fx]+ \d+ \(([0-9a-fA-Fx]+)\)', s_list).group(1)
+        #sender_addr = re.search(r'CREATE_COIN [0-9a-fA-Fx]+ \d+ \(([0-9a-fA-Fx]+)\)', s_list).group(2)
+        cat_pattern = r'CREATE_COIN ([0-9a-fx]+).*?CREATE_COIN ([0-9a-fx]+)'
+        sender_addr = re.search(cat_pattern, s_list, re.DOTALL).group(2)
+
         a, tail_hash, b = args.as_iter()
         tail_hash = str(tail_hash)
         return {
-            # "sender_puzzle_hash":  sender_addr,
-            # "asset_id": tail_hash
-
             "sender_puzzle_hash": sender_addr,
-            # replace is hackish not sure why tail_hash always has the added a0
+            "s_exp_list:": s_list,
+            # replace is hackish not sure why tail_hash always has the prefixed a0
             "asset_id": tail_hash.replace("a0", "0x", 1) if tail_hash.startswith("a0") else tail_hash
         }
 
