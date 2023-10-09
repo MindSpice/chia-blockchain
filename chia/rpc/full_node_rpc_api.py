@@ -993,7 +993,6 @@ class FullNodeRpcApi:
             "min_valid_fee": sb_cost * 5,
         }
 
-
     async def get_mempool_info(self, request: Dict):
         return {
             "mempool_current_cost_size": self.service.mempool_manager.mempool.total_mempool_cost,
@@ -1004,91 +1003,16 @@ class FullNodeRpcApi:
         return {"height": self.service.blockchain.get_peak().height}
 
 
-    # if not request["coin_record"]:
-    #     raise ValueError("Must include coin_record")
-    #
-    # record = request["coin_record"]
-    # dict = {
-    #     "coin_id": record["coin"]["parent_coin_info"],
-    #     "height": record["confirmed_block_index"]
-    # }
-    #
-    # spend_dict = await self.get_puzzle_and_solution(dict)
-    # coin_solution = CoinSpend.from_json_dict(spend_dict["coin_solution"])
-    # program, _ = coin_solution.solution.to_program().uncurry()
-    # list = disassemble(program)
-    #
-    # matches = re.findall(r'\(CREATE_COIN ([^ ]+) ([^)]+)\)', list)
-    #
-    # return {"unwrapped_puzzlehash": matches[1][0]}
-
-
-
-    async def unwrap_cat_address(self, request: Dict):
-
-        def get_tail_wrapped_puzhash(xch_puzhash: Union[str, bytes32], tail: Union[str, bytes32]) -> bytes32:
-            """
-            Returns the tail-wrapped puzzle hash for a given XCH puzzle hash
-            """
-            if not isinstance(tail, bytes):
-                tail = bytes.fromhex(tail)
-            if not isinstance(xch_puzhash, bytes):
-                xch_puzhash = bytes.fromhex(xch_puzhash)
-
-            return CAT_MOD.curry(
-                CAT_MOD.get_tree_hash(), tail, xch_puzhash
-            ).get_tree_hash(xch_puzhash)
-
-        if not request["coin_record"]:
-            raise ValueError("Must include coin_record")
-
-        record = request["coin_record"]
-        parent_dict = {
-            "coin_id": record["coin"]["parent_coin_info"],
-            "height": record["confirmed_block_index"]
-        }
-        parent_spend = await self.get_puzzle_and_solution(parent_dict)
-        parent_program = parent_spend.solution.to_program()
-
-        coin_solution = CoinSpend.from_json_dict(spend_dict["coin_solution"])
-        mod, args = coin_solution.puzzle_reveal.to_program().uncurry()
-        if not mod == CAT_MOD:
-            raise ValueError("Coin is not a CAT")
-
-        a, tail_hash, b = args.as_iter()
-        tail_hash = str(tail_hash)
-        tail_hash = tail_hash.replace("a0", "0x", 1) if tail_hash.startswith("a0") else tail_hash
-
-        inner_solution = parent_program.at("frfr")
-        payments = []
-        for condition in inner_solution.as_iter():
-            condition_list = condition.as_atom_list()
-            if condition_list[0] == ConditionOpcode.CREATE_COIN:
-                payments.append(Payment.from_condition(condition))
-
-        for p in payments:
-            if get_tail_wrapped_puzhash(p.puzzle_hash, tail_hash) == record.coin.puzzle_hash:
-                return {
-                    "sender_puzzle_hash": get_tail_wrapped_puzhash + "| " + record.coin.puzzle_hash,
-                    "tail_hash" : tail_hash
-                }
-
-        raise ValueError("Sender not found")
-
-
     async def get_cat_sender_info(self, request: Dict):
-
-
         if not request["coin_record"]:
             raise ValueError("Must include coin_record")
 
-        record = request["coin_record"]
-        parent_record = self.get_coin_record_by_name(record["parent_coin_info"])
-
+        record = request
+        parent_coin = await self.get_coin_record_by_name({"name": request["coin_record"]["coin"]["parent_coin_info"]})
 
         dict = {
-            "coin_id": record["coin"]["parent_coin_info"],
-            "height": record["confirmed_block_index"]
+            "coin_id": record["coin_record"]["coin"]["parent_coin_info"],
+            "height": record["coin_record"]["confirmed_block_index"]
         }
         spend_dict = await self.get_puzzle_and_solution(dict)
 
@@ -1099,22 +1023,31 @@ class FullNodeRpcApi:
             raise ValueError("Coin is not a CAT")
 
         program, _ = coin_solution.solution.to_program().uncurry()
-        s_list = disassemble(program)
-        sender_match = re.search(r'CREATE_COIN [0-9a-fA-Fx]+ \d+ \(([0-9a-fA-Fx]+)\)', s_list)
-       # cat_pattern = r'CREATE_COIN ([0-9a-fx]+).*?CREATE_COIN ([0-9a-fx]+)'
-       # sender_match = re.search(cat_pattern, s_list, re.DOTALL)
-        if sender_match:
-            sender_addr = sender_match.group(1)
-        else:
-            sender_addr = ""
-
 
         a, tail_hash, b = args.as_iter()
         tail_hash = str(tail_hash)
+        # replace is hackish not sure why tail_hash always has the prefixed a0
+        tail_hash = tail_hash.replace("a0", "0x", 1) if tail_hash.startswith("a0") else tail_hash
+        tail_bytes = bytes.fromhex(tail_hash[2:])
+        parent_puzzle = bytes32.from_hexstr(parent_coin["coin_record"]["coin"]["puzzle_hash"])
+
+        sender_addr: str = None
+        for i, e in enumerate(program.as_iter()):
+            exp = disassemble(e).split(" ")
+            if len(exp) == 3 and len(exp[1]) == 66:
+                arg_hash = bytes.fromhex(exp[1][2:])
+                cat_addr = CAT_MOD.curry(
+                    CAT_MOD.get_tree_hash(), tail_bytes, arg_hash
+                ).get_tree_hash_precalc(arg_hash)
+
+                if str(cat_addr) == str(parent_puzzle):
+                    sender_addr = exp[1]
+
+        if sender_addr is None:
+            raise ValueError("Sender address not found")
+
         return {
             "sender_puzzle_hash": sender_addr,
-            "s_exp_list:": s_list,
-            # replace is hackish not sure why tail_hash always has the prefixed a0
-            "asset_id": tail_hash.replace("a0", "0x", 1) if tail_hash.startswith("a0") else tail_hash
+            "asset_id": tail_hash
         }
 
