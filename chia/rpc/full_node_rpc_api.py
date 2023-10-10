@@ -36,7 +36,6 @@ from chia.wallet.util.debug_spend_bundle import disassemble, uncurry_dump
 from chia.wallet.puzzles.tails import CAT_MOD
 
 
-
 def coin_record_dict_backwards_compat(coin_record: Dict[str, Any]) -> Dict[str, bool]:
     coin_record["spent"] = coin_record["spent_block_index"] > 0
     return coin_record
@@ -58,9 +57,9 @@ async def get_nearest_transaction_block(blockchain: Blockchain, block: BlockReco
 
 
 async def get_average_block_time(
-    blockchain: Blockchain,
-    base_block: BlockRecord,
-    height_distance: int,
+        blockchain: Blockchain,
+        base_block: BlockRecord,
+        height_distance: int,
 ) -> Optional[uint32]:
     newer_block = await get_nearest_transaction_block(blockchain, base_block)
     if newer_block.height < 1:
@@ -579,12 +578,12 @@ class FullNodeRpcApi:
         delta_iters = newer_block.total_iters - older_block.total_iters
         weight_div_iters = delta_weight / delta_iters
         additional_difficulty_constant = self.service.constants.DIFFICULTY_CONSTANT_FACTOR
-        eligible_plots_filter_multiplier = 2**plot_filter_size
+        eligible_plots_filter_multiplier = 2 ** plot_filter_size
         network_space_bytes_estimate = (
-            UI_ACTUAL_SPACE_CONSTANT_FACTOR
-            * weight_div_iters
-            * additional_difficulty_constant
-            * eligible_plots_filter_multiplier
+                UI_ACTUAL_SPACE_CONSTANT_FACTOR
+                * weight_div_iters
+                * additional_difficulty_constant
+                * eligible_plots_filter_multiplier
         )
         return {"space": uint128(int(network_space_bytes_estimate))}
 
@@ -945,22 +944,29 @@ class FullNodeRpcApi:
             "last_tx_block_height": last_tx_block_height,
         }
 
-###########################################################################################
-## CUSTOM
-###########################################################################################
+    ###########################################################################################
+    ## CUSTOM
+    ###########################################################################################
 
     async def get_nft_recipient_address(self, request: Dict) -> EndpointResult:
-        if "puzzle_reveal" not in request:
-            raise ValueError("No puzzle_reveal in request")
-        if "solution" not in request:
-            raise ValueError("No solution in request")
+        if "coin_name" not in request:
+            raise ValueError("Must include coin_name")
 
-        puzzle: Program = Program.fromhex(request["puzzle_reveal"])
-        solution: Program = Program.fromhex(request["solution"])
-        result: Program = puzzle.run(solution)
 
+        coin_record = await self.get_coin_record_by_name({"name":request["coin_name"]})
+        parent_coin = await self.get_coin_record_by_name({"name": coin_record["coin_record"]["coin"]["parent_coin_info"]})
+        puzzle_and_solution = await self.get_puzzle_and_solution(
+            {
+                "coin_id": coin_record["coin_record"]["coin"]["parent_coin_info"],
+                "height": parent_coin["coin_record"]["spent_block_index"]
+            }
+        )
+
+        coin_spend: CoinSpend = puzzle_and_solution["coin_solution"]
+        result: Program = coin_spend.puzzle_reveal.to_program().run(coin_spend.solution.to_program())
+
+        sender_puzzle_hash = None
         conditions = result.as_iter()
-        sender_puzzle_hash: str
         for condition in conditions:
             if condition.first() == 51:
                 cond = disassemble(condition)
@@ -1001,7 +1007,6 @@ class FullNodeRpcApi:
 
     async def get_height(self, request: Dict):
         return {"height": self.service.blockchain.get_peak().height}
-
 
     async def get_cat_sender_info(self, request: Dict):
         if not request["coin_record"]:
@@ -1050,4 +1055,3 @@ class FullNodeRpcApi:
             "sender_puzzle_hash": sender_addr,
             "asset_id": tail_hash
         }
-
